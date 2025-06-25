@@ -1,0 +1,2016 @@
+---
+title: "Waikato Transport Analysis"
+output: html_notebook
+---
+
+- split map jobs function so that the households and pop per zone are calculated, then this intermediate output can be used for all the other census variables rather than loading in the address data everytime
+- or can i just use the jobs_h3 output anyway?
+#load in previous analysis
+```{r}
+#ttm data
+ttm_bicycle_results_list <- readRDS("ttm_bicycle_results_list.rds")
+
+#access to jobs and education
+walk_results <- readRDS("walk_results.rds")
+cycling_results <- readRDS() 
+transit_results <- readRDS()
+car_results <- readRDS()
+```
+# load packages and functions -----------------------------------------
+```{r}
+#increases memory available to java
+options(java.parameters = "-Xmx4G")
+
+# install dev version with latest features
+#devtools::install_github("ipeaGIT/r5r", subdir = "r-package")
+
+library(r5r)
+library(sf)
+library(data.table)
+library(interp)
+library(tmap)
+library(dplyr)
+library(accessibility)
+#load additional packages
+library (osmdata)
+library(osmextract)
+library(h3jsr)
+library(purrr)
+library(ggplot2)
+packageVersion ("osmdata")
+source("C:\\Users\\ellio\\OneDrive\\Documents\\GIS Data\\R5R\\my_functions.r")
+#https://ipeagit.github.io/r5r/articles/accessibility.html
+tmap_mode("view")
+```
+
+
+
+# define area of analysis ---------------------
+
+#Create bounding box for townships
+```{r}
+#http://bboxfinder.com/
+# Create a matrix with the bounding box coordinates and ensure it is closed
+waikato_bbox <- create_bounding_box(174.987992,-37.513760, 120)
+#tm_shape(waikato_bbox) + tm_polygons(alpha = 0.5)
+
+#create all the bbox's
+raglan_bbox <- tidygeocoder::geo(address = "Raglan, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))() #\(df) defines a function and () at the end call it 
+
+pokeno_bbox <- tidygeocoder::geo(address = "Pokeno, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+port_waikato_bbox <- tidygeocoder::geo(address = "Port Waikato, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+horotiu_bbox <- tidygeocoder::geo(address = "Horotiu, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+meremere_bbox <- tidygeocoder::geo(address = "Meremere, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+tuakau_bbox <- tidygeocoder::geo(address = "Tuakau, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+tekauwhata_bbox <- tidygeocoder::geo(address = "Te Kauwhata, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+huntly_bbox <- tidygeocoder::geo(address = "Huntly, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+taupiri_bbox <- tidygeocoder::geo(address = "Taupiri, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+ngaruawahia_bbox <- tidygeocoder::geo(address = "Ngaruawahia, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+maramarua_bbox <- tidygeocoder::geo(address = "Maramarua, Waikato, New Zealand") |> 
+  (\(df) create_bounding_box(df$long, df$lat, size_km = 10))()
+
+bbox_list <- list(raglan_bbox = raglan_bbox, pokeno_bbox = pokeno_bbox, port_waikato_bbox = port_waikato_bbox, horotiu_bbox = horotiu_bbox, meremere_bbox = meremere_bbox, tuakau_bbox = tuakau_bbox, tekauwhata_bbox = tekauwhata_bbox, huntly_bbox = huntly_bbox, taupiri_bbox = taupiri_bbox, ngaruawahia_bbox = ngaruawahia_bbox, maramarua_bbox = maramarua_bbox)
+
+combined_bboxs <- bind_rows(bbox_list, .id = "area_name")
+
+#visually inspect
+#tm_shape(combined_bboxs) + tm_polygons(alpha = 0.5)
+
+```
+
+#create additional bounding box for analysis of wider area
+```{r}
+#reuse existing bbox's
+#Find centroids
+bbox_centroids <- map(bbox_list, ~ st_centroid(st_union(.x)) |> st_coordinates()) 
+
+#create bounding boxes from previously definied custom function
+bbox_list_30km <- map(bbox_centroids, ~ create_bounding_box(.x[1], .x[2], size_km = 20))
+
+#bind together into a single df
+combined_bboxs_30km <- bind_rows(bbox_list_30km, .id = "area_name")
+
+#visually inspect
+#tmap_study_areas_OD <- tm_shape(combined_bboxs_30km) + 
+  #tm_polygons(alpha = 0.5, border.col = "black") + tm_shape(combined_bboxs) + tm_polygons(alpha = 0.5, border.col = "darkgreen") + tm_layout(title = "Waikato Study Area (black = destinations, green = origins")
+
+#tmap_save(tmap_study_areas_OD, "Waikato Study Areas.html")
+
+```
+
+
+#global parameters -----------------------------------------
+
+Routing inputs and modes
+```{r}
+# routing inputs
+mode <- c("TRANSIT")
+max_walk_time <- 45      # in minutes
+max_trip_duration <- 60 # in minutes
+time_window <- 60       # in minutes
+departure_datetime <- as.POSIXct("25-03-2025 08:30:00",
+                                 format = "%d-%m-%Y %H:%M:%S")
+walk_speed <- 5.1
+time_intervals <- seq(0, 100, 10)
+#res 8 for cars res 10 for everything else
+res <- 10
+amenities <- c("school", "hospital", "university", "bus_station", "charging_station", "dentist", "doctors", "police", "post_office", "toilets")
+```
+
+# Load in opportunities data
+
+    
+```{r}
+#amenity data
+opportunities <- download_opq_opportunities(waikato_bbox |> st_bbox(), amenities = amenities, res = res, place_name = "Waikato")
+```
+
+#ensure land use data ids align to ttm so that there are no incorrect NA's passed
+
+Without this the travel times may come back as NA's rather than the actual times.
+```{r}
+#add additional zone id's
+opportunities$combined_summary_all <- opportunities$summary |>
+  rows_insert(waikato_routing_cells, conflict = "ignore") |> #ignore means nonconflicted rows are added
+  mutate(across(
+    where(is.numeric), #only apply to numeric columns
+    ~ tidyr::replace_na(., 0)
+  ))
+#checks
+opportunities$combined_summary_all |> View()
+opportunities$combined_summary_all |> ncol()
+opportunities$summary |> ncol()
+
+#check data is identical
+opportunities$combined_summary_all %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE)) == opportunities$combined_summary %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE))
+```
+
+#Load Census data
+```{r}
+#load saved data or rerun?
+read_save_location <- "C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Waikato"
+  
+#custom function to read in and subset data
+census_subset <- load_census_data(load_or_recreate_census = "load", study_area = waikato_bbox, read_save_location = read_save_location)
+```
+
+#load resident data
+```{r}
+#load data
+#census_subset_resident <- readRDS("census_waikato_resident.rds")
+
+#filter data for resident
+census_subset_resident <- census_subset %>%
+  filter(CEN23_TBT_IND_003..Variable.codes == "egTotal: Ethnicity (total responses) - total census usually resident population count" &
+           CEN23_YEAR_001..Census.year == 2023 &
+           OBS_VALUE < 4993922) %>%
+  na.omit()
+
+# save the object
+saveRDS(census_subset_resident, "census_waikato_resident.rds")
+```
+
+#visual inspection of census population
+```{r}
+tm_shape(census_subset_resident |> st_as_sf()) + tm_polygons(col = "OBS_VALUE", alpha = 0.5)
+```
+
+#extract jobs data
+```{r}
+census_jobs <- census_subset |> filter(CEN23_TBT_IND_003..Variable.codes == "inwTotal: Industry, by workplace address - total employed census usually resident population count aged 15 years and over" &
+           CEN23_YEAR_001..Census.year == 2023)
+```
+
+#Map the job data to the hex grid
+```{r}
+
+map_jobs_to_h3 <- function(load_or_recreate_census = "recreate", census_jobs, study_area, res, read_save_location) {
+  # Construct path to saved file (in case only a directory is passed)
+  saved_file_path <- file.path(read_save_location, "census_jobs_mapped.rds")
+  
+  census_jobs <- census_jobs |> st_as_sf()
+  
+  # Read all NZ address data and crop to study area
+  addresses <- st_read("C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Pokeno/lds-nz-addresses-SHP/nz-addresses.shp") %>%
+    st_crop(study_area)
+  
+  # Join addresses to census job zones
+  addresses_within <- addresses |>
+    st_join(census_jobs, join = st_within)
+  
+  # Process address counts and jobs allocation
+  addresses_within_2 <- addresses_within |> 
+    group_by(SA12023_V1) |> 
+    mutate(dwellings_in_SA1 = n()) |> 
+    ungroup() |> 
+    mutate(
+      jobs_per_dwelling_SA1 = OBS_VALUE / dwellings_in_SA1,
+      h3_address = point_to_cell(geometry, res = res, simple = TRUE)
+    ) |> 
+    st_drop_geometry() |>  # Drop original point geometries before aggregation
+    group_by(h3_address) |> 
+    summarise(
+      dwellings_h3 = n(),
+      jobs = mean(jobs_per_dwelling_SA1, na.rm = TRUE) * mean(dwellings_h3),
+      .groups = "drop"
+    ) |> 
+    cell_to_polygon(simple = FALSE) |> 
+    st_as_sf()
+  
+  # Create tmap
+  tmap_jobs <- tm_shape(addresses_within_2) + 
+    tm_polygons(
+      col = "jobs",
+      title = "Jobs",
+      alpha = 0.5,
+      lwd = 0,
+      palette = "YlGn",
+      style = "cont",
+      popup.vars = c("jobs", "dwellings_h3")
+    ) +
+    tm_layout(title = "Jobs")
+
+  # Save outputs
+  saveRDS(addresses_within_2, saved_file_path)
+  
+  message(paste("Job data saved to", saved_file_path))
+  
+  return(list(jobs_data = addresses_within_2, map = tmap_jobs))
+}
+
+
+#custom function to map jobs to h3 grid
+jobs_h3 <- map_jobs_to_h3(load_or_recreate_census = "load", census_jobs = census_jobs, study_area = waikato_bbox, res = res, read_save_location = read_save_location)
+
+jobs_h3$jobs_data$h3_address[1] |> get_res()
+
+#visually inspect original census job data
+tm_shape(census_jobs |> st_as_sf()) + tm_polygons(col = "OBS_VALUE", alpha = 0.5, palette = "YlGn") + jobs_h3$map
+
+#save map
+tmap_save(tm_shape(census_jobs |> st_as_sf()) + tm_polygons(col = "OBS_VALUE", alpha = 0.5, palette = "YlGn") + jobs_h3$map, "Waikato Jobs (Census and h3).html")
+
+```
+
+#map resident population to hex grid
+```{r}
+map_population_to_h3 <- function(load_or_recreate_census = "recreate", census_pop, study_area, res, read_save_location) {
+  # Construct path to saved file (in case only a directory is passed)
+  saved_file_path <- file.path(read_save_location, "census_pop_mapped.rds")
+  
+  census_pop <- census_pop |> st_as_sf()
+  
+  #read in all NZ address data
+  addresses <- st_read("C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Pokeno/lds-nz-addresses-SHP/nz-addresses.shp") %>%
+  st_crop(study_area)
+  
+  #updated code
+  addresses_within <-  addresses |> 
+  st_join(census_pop, join = st_within)
+
+  addresses_within_2 <- addresses_within |> 
+    group_by(SA12023_V1) |> 
+    mutate(dwellings_in_SA1 = n()) |> 
+    ungroup() |>
+    mutate(population_per_dwelling_SA1 = OBS_VALUE / dwellings_in_SA1,
+           h3_address = point_to_cell(geometry, res = res, simple = TRUE)) |>
+    st_drop_geometry() |> #otherwise combines all point data
+    group_by(h3_address) |>
+    summarise(dwellings_h3 = n(), 
+              population = mean(population_per_dwelling_SA1) * mean(dwellings_h3)) |>
+    cell_to_polygon(simple = FALSE)
+  
+  tmap_pop <- tm_shape(addresses_within_2) + tm_polygons(col = "population", title = "Population", alpha = 0.5, lwd = 0, palette = "YlGn", style = "cont", popup.vars = c("population", "dwellings_h3")) + tm_layout(title = "Population")
+  
+  saveRDS(addresses_within_2, saved_file_path)
+  
+  message(paste("pop data saved to ", saved_file_path))
+  
+  return(list(pop_data = addresses_within_2, map = tmap_pop))
+}
+
+#custom function to map pop to h3 grid
+pop_h3 <- map_population_to_h3(load_or_recreate_census = "load", census_pop = census_subset_resident, study_area = waikato_bbox, res = res, read_save_location = read_save_location)
+
+tmap_save(pop_h3$map, "Waikato Population H3.html")
+
+#some strange data issues going on here where there seems to be mismatches with the number of dwellings and the number of people
+
+pop_data_head <- pop_h3$pop_data |> arrange(desc(population)) |> slice_head(n = 10) |> st_as_sf()
+
+#check resolution
+pop_h3$pop_data$h3_address[1] |> get_res()
+
+# Ensure your input is sf
+census_subset_resident <- census_subset_resident %>% st_as_sf()
+
+tmap_census_resident_population <- tm_shape(census_subset_resident) + tm_polygons(alpha = 0.7, col = "OBS_VALUE", palette = "YlGn", title = "Population") + tm_layout(title = "Waikato Census and H3 Population") +
+  pop_h3$map
+
+# Find which census features intersect pop_data_head
+matches <- st_intersects(census_subset_resident, pop_data_head)
+
+# Keep only those that intersect
+high_pop_census <- census_subset_resident[lengths(matches) > 0, ]
+
+matches_address <- st_intersects(pop_h3$addresses, high_pop_census)
+
+high_pop_addresses <-  pop_h3$addresses[lengths(matches_address) > 0,]
+
+matches_h3 <- st_intersects(pop_h3$pop_data, high_pop_census)
+
+high_poph3_absent <- pop_h3$pop_data[lengths(matches_h3) > 0,]
+ 
+
+tm_shape(pop_data_head) + tm_polygons(alpha = 0.7, col = "population", palette = "YlGn") + tm_shape(high_pop_addresses) + tm_dots() + tm_shape(high_pop_census) + tm_polygons(alpha = 0.7, col = "OBS_VALUE", palette = "YlGn") + tm_shape(high_poph3_absent) + tm_polygons(alpha = 0.7, col = "population", palette = "YlGn", border.col = "blue")
+
+## appears that there are issues either with LINZ not picking up all the addresses, or census allocating too many people to those zones. There doesnt appear to be an issue allocation population.
+
+#visually inspect original census job data
+tm_shape(census_jobs |> st_as_sf()) + tm_polygons(col = "OBS_VALUE", alpha = 0.5, palette = "YlGn") + jobs_h3$map
+
+```
+
+
+#########################################
+#extract income data
+##########################################
+```{r}
+#filter data for income
+census_subset_median_income <- census_subset %>%
+  filter(CEN23_TBT_IND_003..Variable.codes == "ibmed: Median ($) - total personal income" &
+           CEN23_YEAR_001..Census.year == 2023) %>%
+  na.omit()
+```
+
+#map income data
+Median income is an average across the zone. No additional work to reallocate based on number of dwellings or population is required
+```{r}
+#join with jobs data
+jobs_population_income <- jobs_h3$jobs_data |> left_join(census_subset_median_income |> 
+                                                          select(CEN23_TBT_GEO_002..Area, OBS_VALUE) |> 
+                                                          rename(median_income = OBS_VALUE), 
+                                                        by = "CEN23_TBT_GEO_002..Area") |>
+  left_join(pop_h3$pop_data |> st_drop_geometry() |> select(h3_address, population), by = "h3_address")
+
+#visually inspect median income data
+tm_shape(jobs_population_income) + tm_polygons(col = "median_income", alpha = 0.5, lwd = 0, palette = "YlGn")
+#doesnt look correct
+tm_shape(census_subset_median_income |> st_as_sf()) + tm_polygons(col = "OBS_VALUE", alpha = 0.5, palette = "YlGn")
+#there is definitely data for central hamilton
+```
+
+# Create routing network for origins. Waikato area h3 id's for routing as origins
+```{r}
+
+census_boundaries <- st_read("C:/Users/ellio/OneDrive/Documents/Census 2023/statsnz-statistical-area-1-2023-generalised-SHP") |> st_transform(st_crs(waikato_bbox)) |> st_crop(waikato_bbox) 
+
+#find h3 cells on land
+land_cells <- polygon_to_cells(census_boundaries |> filter(LANDWATER_ == "Mainland"), res = res, simple = TRUE) |> 
+  list_c() #flatten list
+tmap_mode("plot")
+
+#visually inspect 
+#land_cells |> cell_to_point() |> tm_shape() + tm_dots()
+#census_boundaries|> filter(LANDWATER_ == "Mainland") |> tm_shape() + tm_polygons()
+  
+#create routing cells for all waikato bbox
+all_waikato_routing_cells <- routing_cells(waikato_bbox, res = res)
+
+sub_waikato_routing_cells <- all_waikato_routing_cells[all_waikato_routing_cells$id %in% land_cells,]
+
+
+#visual inspection
+tmap_mode("plot")
+#sub_waikato_routing_cells |> tm_shape() + tm_dots()
+
+#assign as waikato_routing_cells
+waikato_routing_cells <- sub_waikato_routing_cells
+
+rm(all_waikato_routing_cells, sub_waikato_routing_cells, census_boundaries)
+```
+################################################################
+#walking time matrix and access to jobs and education
+#################################################################
+Create TTM, undertake access analysis, summarise results and then delete intermediate steps to save working memory.
+
+
+
+
+#Setup core
+```{r}
+
+destfile <- "C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Waikato/router_do_min"
+
+# Example: Load R5 network
+r5r_core_waikato <- setup_r5(data_path = destfile, overwrite = FALSE)
+
+```
+
+
+#walking ttm
+
+This creates a many to many matrix of walk times to all other areas. This means the ouputs should also be usable for access to the town centre as well as access to schools, for example.
+ 
+```{r}
+#read in saved data
+ttm_walk_results_list <- readRDS("ttm_walk_results_list.rds")
+
+#customer function to run ttm for all study areas
+run_ttm_for_area <- function(study_area, wider_study_area, area_id, mode) {
+  
+  #crop destinations 
+  cropped_destinations <- waikato_routing_cells[
+  st_intersects(waikato_routing_cells, study_area, sparse = FALSE),]
+  
+  #crop origins
+  cropped_origins <- waikato_routing_cells[
+  st_intersects(waikato_routing_cells, wider_study_area, sparse = FALSE),]
+  
+  #catch an issues with origin data
+  if (nrow(cropped_destinations) == 0) {
+    warning(paste("No origins found for area", area_id))
+    return(NULL)
+  }
+  
+  #run travel time matrix
+  ttm <- travel_time_matrix(
+    r5r_core_waikato,
+    origins = cropped_origins,
+    destinations = cropped_destinations,
+    mode = mode, #change mode independently of global settings
+    departure_datetime = departure_datetime,
+    max_walk_time = max_walk_time,
+    max_trip_duration = max_trip_duration,
+    walk_speed = walk_speed
+  )
+ 
+  return(ttm)
+}
+
+#loop of list of bboxs
+ttm_walk_results_list <- purrr::pmap(list(st_geometry(combined_bboxs),
+                                          st_geometry(combined_bboxs_30km), 
+                                          combined_bboxs$area_name,
+                                          c(rep("WALK", 11))),
+  .f = run_ttm_for_area) |> set_names(combined_bboxs$area_name)
+
+saveRDS(ttm_walk_results_list, "ttm_walk_results_list.rds")
+```
+
+##########################################################
+#map and save interactive walk ttm map
+
+Take the centroid of the study areas, which is typically the town centre and crop so that we have walking access to that location. 
+
+This can also be re-used for a number of other locations, if we chant the centroid list to something else.
+```{r}
+#find centroid h3s
+bbox_h3_all <- bbox_list |> bind_rows() |> st_centroid() |> point_to_cell(res = res)
+
+bbox_h3_all <- c(bbox_h3_all,"8abb54726237fff") #additional point for raglan which seems to get cut off
+
+bbox_h3_all <- bbox_h3_all[1:11]
+
+#filter the ttm's based on the locations included in the above
+tmap_ttm_walk <- ttm_walk_results_list |> 
+  bind_rows(.id = "area") |> 
+  filter(to_id %in% bbox_h3_all) |>
+  relocate(from_id, .before = everything()) |>
+  cell_to_polygon(simple = FALSE) |> 
+  st_as_sf() |> 
+  tm_shape() + tm_polygons(col = "travel_time_p50", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Walk Travel Time to Town Centre")
+
+#save tmap
+tmap_save(tmap_ttm_walk, "Waikato Town Centre Access by Walking.html")
+```
+
+
+The Street network is an output included in all the maps.
+```{r}
+street_network <- r5r::street_network_to_sf(r5r_core_waikato)
+
+street_network <- st_transform(street_network$edges, st_crs(waikato_bbox)) |>  
+  filter(street_class %in% c("MOTORWAY", "SECONDARY", "TERTIARY")) #add "OTHER" if not mapping well
+
+object.size(street_network) / 1000000
+```
+
+
+###########################################################
+# calculate walking access to jobs and schools and save as an interactive map
+
+- check the script will use the revised origin and destinations so that area cut off by water arent included
+- 
+```{r}
+#load in previous data
+#walk_results <- readRDS("walk_results.rds")
+
+#cost to closest 1k jobs
+threshold <- 1000 #considered lower threshold for walking but think this is still helpful, only Horotiu worked at 5k
+
+calculate_access_to_jobs <- function(ttm, area){
+  
+  #add jobs to ttm
+  ttm <- ttm %>%
+    left_join(jobs_h3$jobs_data |> select(h3_address, jobs), by = join_by("to_id" == "h3_address"))
+  
+  ttm_threshold <- ttm %>%
+  arrange(from_id, travel_time_p50) %>%
+  group_by(from_id) %>%
+  mutate(
+    cum_jobs = cumsum(jobs)) %>%
+  filter(cum_jobs >= threshold) %>%
+  slice_min(order_by = travel_time_p50, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(from_id, min_time_to_1k_jobs = travel_time_p50, cum_jobs) |> #check from_id name is correct
+  mutate(area = area)
+  
+  return(ttm_threshold)
+
+}
+
+ttm_walk_threshold_results <- purrr::map2(.x = ttm_walk_results_list,
+            .y = names(ttm_walk_results_list), #what is the output from the ttms?
+            .f = calculate_access_to_jobs)
+
+#visually inspect ttm_walk_thresholds
+
+ttm_walk_threshold_results|> bind_rows(.id = "area") |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "min_time_to_1k_jobs", alpha = 0.7, palette = "YlGn", style = "cont")
+
+#cost to closest school
+
+calculate_access_to_school <- function(ttm, area, land_use_data, travel_cost = "travel_time_p50"){
+  
+  cost_to_closest <- cost_to_closest(ttm, 
+                land_use_data = land_use_data,
+                opportunity = "school", 
+                travel_cost = travel_cost) |>
+    mutate(travel_time_p50 = ifelse(travel_time_p50 == Inf, NA, travel_time_p50)) #inf results to NA
+  
+  return(cost_to_closest)
+}
+
+# is the opportunities data at the right resolution?
+
+school_access_results <- purrr::map2(.x = ttm_walk_results_list, #it expects a list so no prep required
+                                     .y = names(ttm_walk_results_list),
+                                     .f = calculate_access_to_school,
+                                     opportunities$combined_summary_all,
+                                     .progress = TRUE)
+
+#combine school results for mapping
+tmap_school_access <- school_access_results |> bind_rows(.id = "area") |> relocate(id, .before = everything()) |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "travel_time_p50", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Walk Travel Time to Nearest School")
+
+#save tmap
+tmap_save(tmap_school_access, "Waikato School Access by Walking.html")
+
+#combine jobs access results for mapping
+tmap_jobs_access <- ttm_walk_threshold_results |> bind_rows(.id = "area") |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "min_time_to_1k_jobs", alpha = 0.7, palette = "-YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time") + tm_layout(title = "Walk Travel Time to Nearest 1k Jobs")
+
+#save tmap
+tmap_save(tmap_jobs_access, "Waikato Jobs Access by Walking.html")
+
+walk_results <- list(ttm_walk_threshold_results, school_access_results)
+
+saveRDS(walk_results, "walk_results.rds")
+
+
+```
+
+#############################################################3
+#create standardised walking maps to town centre and save
+
+Finds the centroid of the bbox and filters the ttm to that zone. 
+```{r}
+static_population_mapping <- function(sf_data, colour = "travel_time_p50", legend_title, location, res, mode, r5r_core, bbox, variable = "population"){
+  
+  #find centroid h3 of destination
+  centroid_h3 <- bbox |> 
+    st_centroid() |> 
+    point_to_cell(res = res, simple = TRUE)
+  
+  #combine travel times with job, income and population data
+  ttm <- sf_data 
+  
+  ttm_to_centroid <- ttm |> 
+    filter(to_id == centroid_h3) |> 
+    left_join(pop_h3$pop_data |> 
+                select(h3_address, population) |>
+                st_drop_geometry(), 
+              by = join_by("from_id" == "h3_address")) |> #interested in population at origin
+    cell_to_polygon(simple = FALSE) %>%
+    st_as_sf()
+  
+  axis_title <- paste(legend_title, "to", location, "by", mode, "at res", res, sep =  " ")
+  
+  street_network <- street_network  |> 
+    st_crop(bbox)
+  
+  #convert to bbox format
+  bbox <- bbox |> st_bbox()
+  
+  map <- ggplot(ttm_to_centroid) +
+    geom_sf(aes(fill = !!sym(colour)), colour = NA, size = 0.01) +
+    scale_fill_viridis_c(direction = 1) +
+    labs(fill = legend_title) +
+    ggtitle(axis_title) +
+    theme_minimal() +
+    theme(legend.position = "right",
+          axis.text = element_blank(),  
+          axis.ticks = element_blank()) +
+    geom_sf(data = street_network, linewidth = 0.1, colour = "gray57") +
+    coord_sf(
+      xlim = c(bbox["xmin"], bbox["xmax"]),
+      ylim = c(bbox["ymin"], bbox["ymax"]),
+    )
+  
+  #create binned travel time to population data
+  aggregated_data <- ttm_to_centroid %>%
+    mutate(
+      travel_time_bin = cut(
+        travel_time_p50,
+        breaks = seq(0, max(travel_time_p50, na.rm = TRUE), by = 5),
+        right = FALSE,  # Left-closed, right-open intervals
+        labels = paste(seq(0, max(travel_time_p50, na.rm = TRUE) - 5, by = 5), 
+                       seq(5, max(travel_time_p50, na.rm = TRUE), by = 5),
+                       sep = "-")
+      )
+    ) %>%
+    group_by(travel_time_bin) %>%
+    summarise(population = sum(population, na.rm = TRUE))
+  
+  # Plot
+  legend_plot <- ggplot(aggregated_data,
+                        aes(y = population, x = travel_time_bin, fill = travel_time_bin)) +
+    geom_col(width = 1) +
+    scale_fill_viridis_d(direction = 1) +
+    labs(x = "Travel Time", y = "Population", fill = "Travel Time") +
+    theme_minimal() +
+    coord_flip()
+  
+  legend <- ggplotGrob(legend_plot)
+ 
+# save map
+  ggsave(paste0(axis_title, ".png"), plot = map, device = "png")
+  
+  #save the population histogram
+  histogram_title <- paste(legend_title, "to", location, "by", mode, "histogram", sep =  " ")
+  ggsave(paste0(histogram_title, ".png"), plot = legend, device = "png")
+  
+  #write.csv(ttm, paste(axis_title, ".csv", sep = ""))
+  
+  message("data saved to file")
+  
+  return(map)
+}
+
+#map over the function
+maps_population_all <- purrr::pmap(
+  list(
+    sf_data = ttm_walk_results_list,
+    location = names(ttm_walk_results_list),
+    bbox = bbox_list
+  ),
+  function(sf_data, location, bbox) {
+    static_population_mapping(
+      sf_data = sf_data,
+      colour = "travel_time_p50",
+      legend_title = "Travel Time",
+      location = location,
+      res = res,
+      mode = "WALK",
+      r5r_core = r5r_core_waikato,
+      bbox = bbox,
+      variable = "Travel Time"
+    )
+  }
+)
+
+
+  #pretty_names <- your_list_of_strings %>%
+  #gsub("_bbox$", "", .) %>% #removes bbox from the end. Global Substitution. data is final arg
+  #gsub("_", " ", .) %>% #removes the underscores
+  #stringr::str_to_title() #creates standard title names
+
+#remove large data sets
+rm(ttm_walk_results_list)
+gc()
+```
+
+#Create standardised static maps for access to schools
+
+A list of data frames concerning access to schools has already been created. We use a similar albeit simpler process to create these maps.
+```{r}
+static_school_mapping <- function(sf_data, colour = "travel_time_p50", legend_title, location, res, mode, r5r_core, bbox, variable = "population"){
+  
+    #combine travel times with job, income and population data
+  ttm <- sf_data |> 
+    filter(!is.na(travel_time_p50)) |>
+    left_join(pop_h3$pop_data |> 
+                select(h3_address, population) |>
+                st_drop_geometry(), 
+              by = join_by("id" == "h3_address")) |> #interested in population at origin
+    cell_to_polygon(simple = FALSE) %>%
+    st_as_sf()
+  
+  axis_title <- paste(legend_title, "to", location, "schools by", mode, "at res", res, sep =  " ")
+  
+  street_network <-  street_network |> 
+    st_crop(bbox)
+  
+  #convert to bbox format
+  bbox <- bbox |> st_bbox()
+  
+  map <- ggplot(ttm) +
+    geom_sf(aes(fill = !!sym(colour)), colour = NA, size = 0.01) +
+    scale_fill_viridis_c(direction = 1) +
+    labs(fill = legend_title) +
+    ggtitle(axis_title) +
+    theme_minimal() +
+    theme(legend.position = "right",
+          axis.text = element_blank(),  
+          axis.ticks = element_blank()) +
+    geom_sf(data = street_network, linewidth = 0.1, colour = "gray57") +
+    coord_sf(
+      xlim = c(bbox["xmin"], bbox["xmax"]),
+      ylim = c(bbox["ymin"], bbox["ymax"]),
+    )
+  
+  #create binned travel time to population data
+  aggregated_data <- ttm %>%
+    mutate(
+      travel_time_bin = cut(
+        travel_time_p50,
+        breaks = seq(0, max(travel_time_p50, na.rm = TRUE), by = 5),
+        right = FALSE,  # Left-closed, right-open intervals
+        labels = paste(seq(0, max(travel_time_p50, na.rm = TRUE) - 5, by = 5), 
+                       seq(5, max(travel_time_p50, na.rm = TRUE), by = 5),
+                       sep = "-")
+      )
+    ) %>%
+    group_by(travel_time_bin) %>%
+    summarise(population = sum(population, na.rm = TRUE))
+  
+  # Plot
+  legend_plot <- ggplot(aggregated_data,
+                        aes(y = population, x = travel_time_bin, fill = travel_time_bin)) +
+    geom_col(width = 1) +
+    scale_fill_viridis_d(direction = 1) +
+    labs(x = "Travel Time", y = "Population", fill = "Travel Time") +
+    theme_minimal() +
+    coord_flip()
+  
+  legend <- ggplotGrob(legend_plot)
+ 
+# save map
+  ggsave(paste0(axis_title, ".png"), plot = map, device = "png")
+  
+  #save the population histogram
+  histogram_title <- paste(legend_title, "to", location, "Schools", "by", mode, "histogram", sep =  " ")
+  ggsave(paste0(histogram_title, ".png"), plot = legend, device = "png")
+  
+  #write.csv(ttm, paste(axis_title, ".csv", sep = ""))
+  
+  message("data saved to file")
+  
+  return(map)
+}
+
+```
+
+# use for individual location
+```{r}
+maps_raglan <- static_school_mapping(
+  sf_data      = school_access_results$raglan_bbox,
+  colour       = "travel_time_p50",
+  legend_title = "Travel Time",
+  location     = "raglan",
+  res          = res,
+  mode         = "WALK",
+  r5r_core     = r5r_core_waikato,
+  bbox         = bbox_list$raglan_bbox,
+  variable     = "Travel Time"
+)
+
+```
+
+
+# Map over the function
+```{r}
+
+#map over the function.
+maps_school_all <- purrr::pmap(
+  list(
+    sf_data = school_access_results,
+    location = names(school_access_results),
+    bbox = bbox_list
+  ),
+  function(sf_data, location, bbox) {
+    static_school_mapping(
+      sf_data = sf_data,
+      colour = "travel_time_p50",
+      legend_title = "Travel Time",
+      location = location,
+      res = res,
+      mode = "WALK",
+      r5r_core = r5r_core_waikato,
+      bbox = bbox,
+      variable = "Travel Time"
+    )
+  }
+)
+```
+
+
+Now find access to bus stops
+
+```{r}
+
+# confirm location of bus stops
+transit_network <- r5r::transit_network_to_sf(r5r_core_waikato)
+
+transit_network <- transit_network$stops |>
+  rowwise() |>
+  filter(!st_is_empty(geometry)) |>
+  st_transform(crs = 4326) |>
+  point_to_cell(simple = FALSE, res = res) |>
+  st_drop_geometry() |>
+  mutate(bus_stop = 1) |> # identifier 
+  select(bus_stop, h3_resolution_10)
+
+
+#update land use data with bus stop locations using waikato routing cells
+
+opportunities$combined_summary_all <- opportunities$combined_summary_all |>
+  left_join(transit_network, by = join_by(id == h3_resolution_10)) |>
+  mutate(across(
+    where(is.numeric), #only apply to numeric columns
+    ~ tidyr::replace_na(., 0)
+  ))
+
+raglan_bus_stop_access <- cost_to_closest(ttm_walk_results_list$raglan_bbox, 
+                land_use_data = opportunities$combined_summary_all,
+                opportunity = "bus_stop", 
+                travel_cost = "travel_time_p50") |>
+    mutate(travel_time_p50 = ifelse(travel_time_p50 == Inf, NA, travel_time_p50))
+```
+# use for individual location
+```{r}
+
+static_bus_stop_mapping <- function(sf_data, colour = "travel_time_p50", legend_title, location, res, mode, bbox, variable = "population"){
+  
+    #combine travel times with job, income and population data
+  ttm <- sf_data |> 
+    filter(!is.na(travel_time_p50)) |>
+    left_join(pop_h3$pop_data |> 
+                select(h3_address, population) |>
+                st_drop_geometry(), 
+              by = join_by("id" == "h3_address")) |> #interested in population at origin
+    cell_to_polygon(simple = FALSE) %>%
+    st_as_sf()
+  
+  axis_title <- paste(legend_title, "to", location, "bus stop by", mode, "at res", res, sep =  " ")
+  
+  street_network <-  street_network |> 
+    st_crop(bbox)
+  
+  #convert to bbox format
+  bbox <- bbox |> st_bbox()
+  
+  map <- ggplot(ttm) +
+    geom_sf(aes(fill = !!sym(colour)), colour = NA, size = 0.01) +
+    scale_fill_viridis_c(direction = 1) +
+    labs(fill = legend_title) +
+    ggtitle(axis_title) +
+    theme_minimal() +
+    theme(legend.position = "right",
+          axis.text = element_blank(),  
+          axis.ticks = element_blank()) +
+    geom_sf(data = street_network, linewidth = 0.1, colour = "gray57") +
+    coord_sf(
+      xlim = c(bbox["xmin"], bbox["xmax"]),
+      ylim = c(bbox["ymin"], bbox["ymax"]),
+    )
+  
+  #create binned travel time to population data
+  aggregated_data <- ttm %>%
+    mutate(
+      travel_time_bin = cut(
+        travel_time_p50,
+        breaks = seq(0, max(travel_time_p50, na.rm = TRUE), by = 5),
+        right = FALSE,  # Left-closed, right-open intervals
+        labels = paste(seq(0, max(travel_time_p50, na.rm = TRUE) - 5, by = 5), 
+                       seq(5, max(travel_time_p50, na.rm = TRUE), by = 5),
+                       sep = "-")
+      )
+    ) %>%
+    group_by(travel_time_bin) %>%
+    summarise(population = sum(population, na.rm = TRUE))
+  
+  # Plot
+  legend_plot <- ggplot(aggregated_data,
+                        aes(y = population, x = travel_time_bin, fill = travel_time_bin)) +
+    geom_col(width = 1) +
+    scale_fill_viridis_d(direction = 1) +
+    labs(x = "Travel Time", y = "Population", fill = "Travel Time") +
+    theme_minimal() +
+    coord_flip()
+  
+  legend <- ggplotGrob(legend_plot)
+ 
+# save map
+  ggsave(paste0(axis_title, ".png"), plot = map, device = "png")
+  
+  #save the population histogram
+  histogram_title <- paste(legend_title, "to", location, "bus stop by", mode, "histogram", sep =  " ")
+  ggsave(paste0(histogram_title, ".png"), plot = legend, device = "png")
+  
+  #write.csv(ttm, paste(axis_title, ".csv", sep = ""))
+  
+  message("data saved to file")
+  
+  return(map)
+}
+
+bus_stop_raglan <- static_bus_stop_mapping(
+  sf_data      = raglan_bus_stop_access |> filter(!is.na(travel_time_p50)),
+  colour       = "travel_time_p50",
+  legend_title = "Travel Time",
+  location     = "raglan",
+  res          = res,
+  mode         = "WALK",
+  bbox         = bbox_list$raglan_bbox,
+  variable     = "Travel Time"
+)
+
+```
+
+#detour analysis
+First this is done for schools as the ttm already exists in a filtered format
+```{r}
+
+schools <- opportunities$combined_summary_all |> filter(school == 1)
+
+raglan_school_detour <- ttm_walk_results_list$raglan_bbox |> 
+  filter(to_id %in% schools$id) |>
+  detour_ratio(1) |> # return full distribution
+  arrange(desc(detour_ratio))  |>
+  filter(travel_time_p50 > 5) # some short long detour journeys 
+
+raglan_detour_origins <- raglan_school_detour |> 
+  select(from_id, detour_ratio) |> 
+  left_join(waikato_routing_cells, by = join_by(from_id == id)) |> 
+  rename(id = from_id) |>
+  filter(!is.na(lon)) # must be an issues with some of the point locations
+
+raglan_detour_destinations <- raglan_school_detour |> 
+  filter(from_id %in% raglan_detour_origins$id) |>
+  select(to_id, detour_ratio) |> 
+  left_join(waikato_routing_cells, by = join_by(to_id == id)) |> 
+  rename(id = to_id) |>
+  filter(!is.na(lon)) # must be an issues with some of the point locations
+# Example: Load R5 network
+
+r5r_core_waikato <- setup_r5(data_path = destfile, overwrite = FALSE)
+
+raglan_school_detour_itineraries <- detailed_itineraries(
+  r5r_core = r5r_core_waikato,
+  origins =  raglan_detour_origins,
+  destinations = raglan_detour_destinations,
+  mode = "WALK",
+  departure_datetime = departure_datetime,
+  max_walk_time = max_walk_time
+)
+
+raglan_school_detour_itineraries <- raglan_school_detour_itineraries |>
+  left_join(raglan_school_detour, by = join_by(from_id, to_id)) |>
+  filter(detour_ratio > 2)
+
+tmap_mode("view")
+
+tmap_raglan_school_detour_itineraries <- tm_shape(raglan_school_detour_itineraries[3,]) + tm_lines(col = "detour_ratio", lwd = 3)
+```
+
+
+################################################################
+#cycling time matrix and access to jobs and education
+#################################################################
+#cycling based
+```{r}
+#load previously calculated ttm
+#ttm_bicycle_results_list <- readRDS("ttm_bicycle_results_list.rds")
+
+run_ttm_for_area <- function(study_area, wider_study_area, area_id) {
+  
+  #crop destinations 
+  cropped_destinations <- waikato_routing_cells[
+  st_intersects(waikato_routing_cells, study_area, sparse = FALSE),]
+  
+  #crop origins
+  cropped_origins <- waikato_routing_cells[
+  st_intersects(waikato_routing_cells, wider_study_area, sparse = FALSE),]
+  
+  #catch an issues with origin data
+  if (nrow(cropped_destinations) == 0) {
+    warning(paste("No origins found for area", area_id))
+    return(NULL)
+  }
+  
+  #run travel time matrix
+  ttm <- travel_time_matrix(
+    r5r_core_waikato,
+    origins = cropped_origins,
+    destinations = cropped_destinations,
+    mode = "BICYCLE", #change mode independently of global settings
+    departure_datetime = departure_datetime,
+    max_walk_time = 10,
+    max_trip_duration = 45,
+    walk_speed = walk_speed
+  )
+ 
+  return(ttm)
+}
+
+#loop of list of bboxs
+ttm_bicycle_results_list <- purrr::pmap(list(st_geometry(combined_bboxs),
+                                          st_geometry(combined_bboxs_30km), 
+                                          combined_bboxs$area_name),
+  .f = run_ttm_for_area) |> set_names(combined_bboxs$area_name)
+
+#save the ttm
+saveRDS(ttm_bicycle_results_list, "ttm_bicycle_results_list.rds")
+
+```
+
+#map and save interactive cycling ttm map
+```{r}
+
+tmap_ttm_bicycle <- ttm_bicycle_results_list |> 
+  bind_rows(.id = "area") |> 
+  filter(to_id %in% bbox_h3_all) |>
+  relocate(from_id, .before = everything()) |>
+  cell_to_polygon(simple = FALSE) |> 
+  st_as_sf() |> 
+  tm_shape() + tm_polygons(col = "travel_time_p50", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Cycle Travel Time to Town Centre")
+
+#save tmap
+tmap_save(tmap_ttm_bicycle, "Waikato Town Centre Access by Cycling.html")
+
+
+```
+
+#cycling access
+```{r}
+#cost to closest 1k jobs
+threshold <- 1000 
+
+#calculate jobs function is already defined
+
+#map over inputs
+ttm_bicycle_threshold_results <- purrr::map2(.x = ttm_bicycle_results_list,
+            .y = names(ttm_bicycle_results_list), #what is the output from the ttms?
+            .f = calculate_access_to_jobs)
+
+#visually inspect ttm_cycle_thresholds
+
+ttm_bicycle_threshold_results|> bind_rows(.id = "area") |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "min_time_to_1k_jobs", alpha = 0.7, palette = "YlGn", style = "cont")
+
+#cost to closest school function already defined
+
+school_bicycle_access_results <- purrr::map2(.x = ttm_bicycle_results_list, #it expects a list so no prep required
+                                     .y = names(ttm_bicycle_results_list),
+                                     .f = calculate_access_to_school,
+                                     opportunities$combined_summary,
+                                     .progress = TRUE)
+
+```
+
+#save cycling access results
+```{r}
+
+bicycling_results <- list(ttm_bicycle_threshold_results, school_bicycle_access_results)
+
+saveRDS(bicycling_results, "bicycle_results.rds")
+
+#combine school results for mapping
+tmap_bicycle_school_access <- school_bicycle_access_results |> bind_rows(.id = "area") |> relocate(id, .before = everything()) |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "travel_time_p50", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Cycle Travel Time to Nearest School")
+
+#save tmap
+tmap_save(tmap_bicycle_school_access, "Waikato School Access by Cycling.html")
+
+#combine jobs access results for mapping
+tmap_bicycle_jobs_access <- ttm_bicycle_threshold_results |> bind_rows(.id = "area") |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "min_time_to_1k_jobs", alpha = 0.7, palette = "-YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time") + tm_layout(title = "Bicycle Travel Time to Nearest 1k Jobs")
+
+#save tmap
+tmap_save(tmap_bicycle_jobs_access, "Waikato Jobs Access by Cycling.html")
+
+#remove large data sets
+
+```
+
+#create standardised cycling maps and save
+```{r}
+#static population mapping function already defined under walking
+
+#map over the function
+maps_population_cycling_all <- purrr::pmap(
+  list(
+    sf_data = ttm_bicycle_results_list,
+    location = names(ttm_bicycle_results_list),
+    bbox = bbox_list
+  ),
+  function(sf_data, location, bbox) {
+    static_population_mapping(
+      sf_data = sf_data,
+      colour = "travel_time_p50",
+      legend_title = "Travel Time",
+      location = location,
+      res = res,
+      mode = "BICYCLE",
+      r5r_core = r5r_core_waikato,
+      bbox = bbox,
+      variable = "Travel Time"
+    )
+  }
+)
+rm(ttm_bicycle_results_list)
+gc()
+```
+
+###########################
+#transit based analysis
+############################
+
+#some pre-checks
+```{r}
+r5r::check_network_status(r5r_core_waikato)
+
+#looks like a gtfs issue
+
+#run gtfs validator?
+```
+
+
+Transit analysis is still failing due to java indexoutofboundsexception.
+
+Based on what I saw earlier, could it be a lack of spatial information with some stops in the gtfs?
+
+```{r}
+#custom function to run ttm for all study areas defined under walking
+
+#loop of list of bboxs
+ttm_transit_results_list <- purrr::pmap(list(st_geometry(combined_bboxs),
+                                          st_geometry(combined_bboxs_30km), 
+                                          combined_bboxs$area_name),
+                                        rep("TRANSIT", 11),
+  .f = run_ttm_for_area) |> set_names(combined_bboxs$area_name)
+
+saveRDS(ttm_transit_results_list, "ttm_transit_results_list.rds")
+
+#run for single location
+raglan_transit_ttm <- run_ttm_for_area(st_geometry(combined_bboxs[1,]),
+                                       st_geometry(combined_bboxs_30km[1,]),
+                                       combined_bboxs$area_name[1],
+                                       "TRANSIT")
+```
+
+#map and save interactive transit ttm map
+```{r}
+tmap_ttm_transit <- ttm_transit_results_list |> 
+  bind_rows(.id = "area") |> 
+  filter(to_id %in% bbox_h3_all) |>
+  relocate(from_id, .before = everything()) |>
+  cell_to_polygon(simple = FALSE) |> 
+  st_as_sf() |> 
+  tm_shape() + tm_polygons(col = "travel_time_p50", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Public Transport Travel Time to Town Centre")
+
+#save tmap
+tmap_save(tmap_ttm_transit, "Waikato Town Centre Access by Public Transport.html")
+```
+
+
+#Transit access
+```{r}
+#cost to closest 1k jobs
+threshold <- 1000 
+
+#calculate jobs function is already defined
+
+#map over inputs
+ttm_transit_threshold_results <- purrr::map2(.x = ttm_transit_results_list,
+            .y = names(ttm_transit_results_list), #what is the output from the ttms?
+            .f = calculate_access_to_jobs)
+
+#cost to closest school function already defined
+
+school_transit_access_results <- purrr::map2(.x = ttm_transit_results_list, #it expects a list so no prep required
+                                     .y = names(ttm_transit_results_list),
+                                     .f = calculate_access_to_school,
+                                     opportunities$combined_summary,
+                                     .progress = TRUE)
+```
+#save transit access results
+```{r}
+transit_results <- list(ttm_transit_threshold_results, school_transit_access_results)
+
+saveRDS(transit_results, "transit_results.rds")
+
+#combine school results for mapping
+tmap_transit_school_access <- school_transit_access_results |> bind_rows(.id = "area") |> relocate(id, .before = everything()) |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "travel_time_p50", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Public Transport Travel Time to Nearest School")
+
+#save tmap
+tmap_save(tmap_transit_school_access, "Waikato School Access by Public Transport.html")
+
+#combine jobs access results for mapping
+tmap_transit_jobs_access <- ttm_transit_threshold_results |> bind_rows(.id = "area") |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "min_time_to_1k_jobs", alpha = 0.7, palette = "-YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time") + tm_layout(title = "Public Transport Travel Time to Nearest 1k Jobs")
+
+#save tmap
+tmap_save(tmap_transit_jobs_access, "Waikato Jobs Access by Public Transport.html")
+
+#remove large data sets
+
+```
+
+#create standardised transit maps and save
+```{r}
+#static population mapping function already defined under walking
+
+#map over the function
+maps_population_transit_all <- purrr::pmap(
+  list(
+    sf_data = ttm_transit_results_list,
+    location = names(ttm_transit_results_list),
+    bbox = bbox_list
+  ),
+  function(sf_data, location, bbox) {
+    static_population_mapping(
+      sf_data = sf_data,
+      colour = "travel_time_p50",
+      legend_title = "Travel Time",
+      location = location,
+      res = res,
+      mode = "TRANSIT",
+      r5r_core = r5r_core_waikato,
+      bbox = bbox,
+      variable = "Travel Time"
+    )
+  }
+)
+rm(ttm_transit_results_list)
+gc()
+```
+
+################################################################
+#Car travel time matrix and access to jobs and education
+#################################################################
+#error catching verions
+```{r}
+#rm(ttm_car_results_list)
+#ttm_car_results_list <- readRDS("ttm_car_results_list.rds")
+
+ttm_sparse_list <- ttm_car_results_list %>%
+  map(~ .x %>%
+         tidyr::pivot_wider(
+           names_from = to_id,
+           values_from = travel_time_p50,
+           values_fill = 0  # or use Inf if that’s your default non-connection
+         ) %>%
+         {
+           df <- .
+           rownames(df) <- df$from_id
+           mat <- as.matrix(select(df, -from_id))
+           Matrix::Matrix(mat, sparse = TRUE)
+         }
+     )
+
+
+
+
+```
+
+#Car based
+```{r}
+#ttm_car_results_list.rds <- readRDS("ttm_car_results_list.rds")
+
+#load previously calculated ttm
+#ttm_bicycle_results_list <- readRDS("ttm_bicycle_results_list.rds")
+
+run_ttm_for_area <- function(study_area, wider_study_area, area_id) {
+  
+  cat("\nStarting area:", area_id, "\n")
+  
+  # crop destinations
+  cropped_destinations <- waikato_routing_cells[
+    st_intersects(waikato_routing_cells, study_area, sparse = FALSE),]
+  
+  cat("Cropped destinations for", area_id, ": ", nrow(cropped_destinations), "cells\n")
+  
+  # crop origins
+  cropped_origins <- waikato_routing_cells[
+    st_intersects(waikato_routing_cells, wider_study_area, sparse = FALSE),]
+  
+  cat("Cropped origins for", area_id, ": ", nrow(cropped_origins), "cells\n")
+  
+  # catch any issues with destination or origin data
+  if (nrow(cropped_destinations) == 0) {
+    warning(paste("No destinations found for area", area_id))
+    return(NULL)
+  }
+  
+  if (nrow(cropped_origins) == 0) {
+    warning(paste("No origins found for area", area_id))
+    return(NULL)
+  }
+  
+  cat("Running travel_time_matrix for", area_id, "...\n")
+  
+  # run travel time matrix with error catching
+  ttm <- tryCatch(
+    {
+      travel_time_matrix(
+        r5r_core_waikato,
+        origins = cropped_origins,
+        destinations = cropped_destinations,
+        mode = "CAR",  # or "TRANSIT", "WALK", etc
+        departure_datetime = departure_datetime,
+        max_walk_time = 5,
+        max_trip_duration = 30,
+        walk_speed = walk_speed
+      )
+    },
+    error = function(e) {
+      message(paste("Error in area", area_id, ":", e$message))
+      return(NULL)
+    }
+  )
+  
+  if (!is.null(ttm)) {
+    cat("Finished travel_time_matrix for", area_id, "\n")
+  } else {
+    cat("Failed travel_time_matrix for", area_id, "\n")
+  }
+  
+  return(ttm)
+}
+
+#loop of list of bboxs
+ttm_car_results_list <- purrr::pmap(list(st_geometry(combined_bboxs),
+                                          st_geometry(combined_bboxs_30km), 
+                                          combined_bboxs$area_name),
+  .f = run_ttm_for_area) |> set_names(combined_bboxs$area_name)
+
+#save the ttm
+saveRDS(ttm_car_results_list, "ttm_car_results_list.rds", compress = "xz")
+
+```
+
+#map and save interactive car ttm map
+```{r}
+#once ttm re run with routing cells then drop the additional raglan point
+tmap_mode("view")
+
+
+
+#ttm_car_results_list$raglan_bbox$to_id |> unique() |> cell_to_point() |> tm_shape() + tm_dots()
+#waikato_routing_cells |> st_crop(bbox_list$raglan_bbox) |> tm_shape() + tm_dots()
+
+#custom function filter and create travel time multipolygons rather than many individual polygons
+filter_large_ttm_list <- function(ttm){
+  ttm <- ttm |>
+    filter(to_id %in% bbox_h3_all) |> #filters to only town centres as destinations
+    relocate(from_id, .before = everything()) |>
+    mutate(tt_bin = cut(travel_time_p50, breaks = seq(0, 60, by = 5))) |>
+    group_by(tt_bin) |>
+    summarise(geometry = cells_to_multipolygon(from_id)) |>
+    st_as_sf()
+  
+    return(ttm)
+}
+#map over function
+ttm_car_town_centres <- purrr::map(.x = ttm_car_results_list, .f = filter_large_ttm_list) |>
+  bind_rows(.id = "area") #collapse list into single object
+
+#test map
+tmap_mode("plot")
+tm_shape(ttm_car_town_centres) + tm_polgons(col = "tt_bin", palette = "viridis")
+
+#test on single df
+
+test_car <- ttm_car_results_list$n
+
+|> #filters to only town centres as destinations
+  relocate(from_id, .before = everything()) |>
+  mutate(tt_bin = cut(travel_time_p50, breaks = seq(0, 60, by = 5))) |>
+  group_by(tt_bin) |>
+  summarise(geometry = cells_to_multipolygon(from_id)) |>
+  st_as_sf()
+
+tm_shape(test_car) + tm_polygons(col = "tt_bin", palette = "viridis")
+
+ttm_car_results_list.rds$raglan_bbox %>% 
+  mutate(id = trimws(from_id)) %>% 
+  filter(is.na(id) | nchar(id) != 15 | grepl("[^0-9a-f]", id)) %>% 
+  distinct(id) %>% 
+  pull(id) %>% 
+  head(20)
+
+
+
+tmap_ttm_car <- ttm_car_results_list |> 
+  bind_rows(.id = "area") |> 
+  filter(to_id %in% bbox_h3_all) |> #filters to only town centres as destinations
+  relocate(from_id, .before = everything()) |>
+  cell_to_polygon(simple = FALSE) |> 
+  st_as_sf() |> 
+  mutate(tt_bin = cut(travel_time_p50, breaks = seq(0, 60, by = 5))) %>%
+  group_by(tt_bin) %>%
+  summarise(geometry = st_union(geometry)) %>% #combines polygons in the same bin
+  ungroup() %>%
+  tm_shape() + tm_polygons(col = "tt_bin", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Car Travel Time to Town Centre")
+
+tmap_ttm_car <- ttm_car_results_list |> 
+  bind_rows(.id = "area") |> #filter to_id first
+  filter(to_id %in% bbox_h3_all) |> #filters to only town centres as destinations
+  relocate(from_id, .before = everything()) |>
+  mutate(tt_bin = cut(travel_time_p50, breaks = seq(0, 60, by = 5)))
+
+#ms_simplify(keep = 0.05) |> #removes unnecersary geometry to retain 5%
+#save tmap
+tmap_save(tmap_ttm_car, "Waikato Town Centre Access by Car.html")
+
+```
+
+#car access
+```{r}
+#cost to closest 1k jobs
+threshold <- 1000 
+
+#calculate jobs function is already defined
+
+#map over inputs
+ttm_car_threshold_results <- purrr::map2(.x = ttm_car_results_list,
+            .y = names(ttm_car_results_list), #what is the output from the ttms?
+            .f = calculate_access_to_jobs)
+
+#visually inspect ttm_cycle_thresholds
+
+ttm_car_threshold_results|> bind_rows(.id = "area") |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "min_time_to_1k_jobs", alpha = 0.7, palette = "YlGn", style = "cont")
+
+#cost to closest school function already defined
+
+school_car_access_results <- purrr::map2(.x = ttm_car_results_list, #it expects a list so no prep required
+                                     .y = names(ttm_car_results_list),
+                                     .f = calculate_access_to_school,
+                                     opportunities$combined_summary,
+                                     .progress = TRUE)
+
+```
+
+#save car access results
+```{r}
+
+car_results <- list(ttm_car_threshold_results, school_car_access_results)
+
+saveRDS(car_results, "car_results.rds")
+
+#combine school results for mapping
+tmap_car_school_access <- school_car_access_results |> bind_rows(.id = "area") |> relocate(id, .before = everything()) |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "travel_time_p50", alpha = 0.7, palette = "YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time P50") + tm_layout(title = "Car Travel Time to Nearest School")
+
+#save tmap
+tmap_save(tmap_car_school_access, "Waikato School Access by Car.html")
+
+#combine jobs access results for mapping
+tmap_car_jobs_access <- ttm_car_threshold_results |> bind_rows(.id = "area") |> cell_to_polygon(simple = FALSE) |> st_as_sf() |> tm_shape() + tm_polygons(col = "min_time_to_1k_jobs", alpha = 0.7, palette = "-YlGn", style = "cont", textNA = ">45 minutes", colorNA = "#74b3eb", lwd = 0, title = "Travel Time") + tm_layout(title = "Car Travel Time to Nearest 1k Jobs")
+
+#save tmap
+tmap_save(tmap_car_jobs_access, "Waikato Jobs Access by Car.html")
+
+
+```
+
+#create standardised car maps and save
+
+
+##################################
+# Big loop for car access w progress checker
+##################################
+
+```{r}
+process_area <- function(
+  area_id,
+  study_area,       # tight bbox for destinations
+  wider_area,       # wider bbox for origins
+  mode,             # "WALK", "BICYCLE", "CAR", or "TRANSIT"
+  ttm_dir,          # where to save raw TTM .rds
+  out_dir           # where to save maps & access .rds
+){
+  cat("\n==== Processing area:", area_id, "====\n")
+  
+  # 1. crop origins & dests
+  origins <- waikato_routing_cells[
+    st_intersects(waikato_routing_cells, wider_area, sparse = FALSE), ]
+  
+  dests   <- waikato_routing_cells[
+    st_intersects(waikato_routing_cells, study_area, sparse = FALSE), ]
+  
+  cat("  • Origins:", nrow(origins), "cells\n")
+  cat("  • Destinations:", nrow(dests), "cells\n")
+  
+  if(nrow(origins)==0 || nrow(dests)==0){
+    warning("No origins/dests for ", area_id)
+    return(NULL)
+  }
+  
+ 
+  # 2. run travel_time_matrix with error catching
+  cat("  • Running travel_time_matrix(", mode, ") …\n")
+  ttm <- tryCatch(
+    {
+      travel_time_matrix(
+        r5r_core_waikato,
+        origins            = origins,
+        destinations       = dests,
+        mode               = mode,
+        departure_datetime = departure_datetime,
+        time_window = 1, #for car it doesnt matter
+        max_walk_time      = 3, #limit off grid walking
+        max_trip_duration  = 30,
+        walk_speed         = 3.6 #reduce walk speed to more realistic speed.
+      )
+    },
+    error = function(e) {
+      message("    ✗ Error in travel_time_matrix for ", area_id, ": ", e$message, "\n")
+      return(NULL)
+    }
+  )
+  if(is.null(ttm)){
+    cat("    → ttm FAILED for", area_id, "\n")
+    return(NULL)
+  } else {
+    cat("    ✓ ttm complete for", area_id, "\n")
+  }
+  
+  # save raw TTM
+  ttm_file <- file.path(ttm_dir, paste0("ttm_", tolower(mode), "_", area_id, ".rds"))
+  saveRDS(ttm, ttm_file)
+  cat("  • Saved raw TTM to", ttm_file, "\n")
+  
+  # 3. build multipolygon map
+  cat("  • Building multipolygon bins …\n")
+  
+  bins <- ttm %>%
+    filter(to_id %in% bbox_h3_all) %>%
+    mutate(tt_bin = cut(travel_time_p50, seq(0, 60, by = 1))) %>%
+    group_by(tt_bin) %>%
+    summarise(h3 = list(unique(from_id)), .groups="drop") %>%
+    rowwise() %>%
+    mutate(geometry = cells_to_multipolygon(h3, simple=TRUE)) %>%
+    st_as_sf(crs=st_crs(waikato_routing_cells))
+  
+  mapfile  <- file.path(out_dir, paste0("map_ttm_", tolower(mode), "_", area_id, ".html"))
+  tmap_mode("view")
+  map_obj <- tm_shape(bins) + tm_polygons(col = "tt_bin", palette="-viridis", alpha=0.5, lwd = 0, title = "Travel Time", textNA = "> 30 Minutes")
+  
+  tmap_save(map_obj, file.path(out_dir, paste0("map_ttm_", tolower(mode), "_", area_id, ".html")))
+  
+  cat("  • Saved interactive map to", mapfile, "\n")
+  
+  # 4. compute 1k-jobs access
+  cat("  • Calculating 1k-jobs access …\n")
+  
+  jobs_access <- ttm %>%
+    left_join(
+      jobs_h3$jobs_data %>% select(h3_address, jobs),
+      by = c(to_id = "h3_address")
+    ) %>%
+    arrange(from_id, travel_time_p50) %>%
+    group_by(from_id) %>%
+    mutate(cum_jobs = cumsum(jobs)) %>%
+    filter(cum_jobs >= 1000) %>%
+    slice_min(travel_time_p50, with_ties=FALSE) %>%
+    ungroup() %>%
+    transmute(
+      from_id,
+      min_time_to_1k_jobs = travel_time_p50,
+      cum_jobs
+    )
+  
+  jobs_file <- file.path(out_dir, paste0("jobs_access_", area_id, ".rds"))
+  saveRDS(jobs_access, jobs_file)
+  cat("  • Saved jobs access to", jobs_file, "\n")
+  
+  # 5. compute nearest-school access
+  cat("  • Calculating school access …\n")
+  
+  school_access <- calculate_access_to_school(ttm, area_id, land_use_data = opportunities$combined_summary_all)
+  
+  school_file <- file.path(out_dir, paste0("school_access_", area_id, ".rds"))
+  
+  saveRDS(school_access, school_file)
+  
+  cat("  • Saved school access to", school_file, "\n")
+  
+  # 6. summary return
+  cat("==== Done with area:", area_id, "====\n")
+  
+  #return key details and access data, but not the ttm
+  return(list(
+    area        = area_id,
+    ttm_file    = ttm_file,
+    map_file    = mapfile,
+    jobs_file   = jobs_file,
+    school_file = school_file,
+    school_access = school_access,
+    jobs_access = jobs_access)
+  )
+}
+
+# Example: run across all areas with progress bar
+library(progressr)
+handlers("txtprogressbar")  # or "rstudio" if you're in RStudio
+
+results <- with_progress({
+  p <- progressor(steps = nrow(combined_bboxs))
+  purrr::pmap(
+    list(
+      area_id    = combined_bboxs$area_name,
+      study_area = st_geometry(combined_bboxs),
+      wider_area = st_geometry(combined_bboxs_30km)
+    ),
+    function(area_id, study_area, wider_area){
+      p(sprintf("Area: %s", area_id))
+      process_area(
+        area_id    = area_id,
+        study_area = study_area,
+        wider_area = wider_area,
+        mode       = "CAR",
+        ttm_dir    = "C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Waikato",
+        out_dir    = "C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Waikato"
+      )
+    }
+  )
+})
+
+#car_test <- readRDS("C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Waikato/ttm_car_raglan_bbox.rds")
+
+```
+
+```{r}
+#static population mapping function already defined under walking
+
+#read in the ttm data
+results |> bind_rows() |> View()
+results |> bind_rows() |> select(map_file)
+
+ttm_car_results_list <- list(raglan = readRDS("ttm_car_raglan_bbox.rds"))
+
+#map over the function
+maps_population_car_all <- purrr::pmap(
+  list(
+    sf_data = ttm_car_results_list,
+    location = names(ttm_car_results_list),
+    bbox = bbox_list
+  ),
+  function(sf_data, location, bbox) {
+    static_population_mapping(
+      sf_data = sf_data,
+      colour = "travel_time_p50",
+      legend_title = "Travel Time",
+      location = location,
+      res = res,
+      mode = "CAR",
+      r5r_core = r5r_core_waikato,
+      bbox = bbox,
+      variable = "Travel Time"
+    )
+  }
+)
+#remove large data sets
+rm(ttm_car_results_list)
+gc()
+```
+
+
+
+############################################
+#Travel time: access to jobs and education
+############################################
+
+
+
+#cycling access
+```{r}
+
+```
+
+#transit access
+```{r}
+
+```
+
+#car access
+```{r}
+
+```
+
+############################
+#agglomeration improvements
+############################
+
+
+
+#map
+```{r}
+tmap <- tmap_access_plot(ttm_waikato, "Waikato TTM by PT", "travel_time_p50", "travel_time_p50")
+```
+
+
+Allocate to hex grid
+```{r}
+waikato_health_centroid <- waikato_health$osm_polygons %>% 
+  st_centroid() %>%
+  point_to_cell(simple = FALSE, res = res)  # 
+
+# %>%
+  rename(id = h3_resolution_7) %>%
+  mutate(opportunities = 1)
+
+waikato_health_centroid <- left_join(waikato_h3_id, waikato_health_centroid[1:3,])
+
+library(tidyr)
+waikato_health_centroid <- mutate(waikato_health_centroid, opportunities = replace_na(opportunities, 0))
+
+```
+
+cumulative hospitals
+```{r}
+# rename column to use {accessibility} package
+#data.table::setnames(ttm_waikato, "travel_time_p50", "travel_time")
+
+
+
+cum_opportunities <- cumulative_cutoff(
+  ttm_waikato,
+  land_use_data = waikato_health_centroid,
+  opportunity = "opportunities",
+  travel_cost = "travel_time",
+  cutoff = 45)
+
+
+```
+
+map this
+```{r}
+ttm_waikato_opps <- cell_to_polygon(cum_opportunities, simple = FALSE)
+
+waikato_opps_poly <- st_as_sf(ttm_waikato_opps)
+
+tmap_waikato_opps <- tm_shape(waikato_opps_poly) + tm_polygons(col = "opportunities", style = "pretty" , alpha = 0.5, palette = "viridis") + tm_borders(alpha = 0.0)
+
+tmap_mode("view")
+
+tmap_waikato_opps #+ tmap_h2s_stops
+
+
+```
+A multicriteria asessement of 
+
+
+# download road network
+##consider updating and using dodgr for routing purposes
+```{r}
+
+#waikato_roads <- opq(waikato_matrix) %>% # Waikato, NZ
+ #   add_osm_feature (key = "highway", value_exact = FALSE) %>%
+    osmdata_sf ()
+waikato_roads
+```
+cost to closest
+```{r}
+opportunity <- "school"
+
+land_use_data <- filter(opportunities$combined_summary, !!sym(opportunity) > 0)
+  
+waikato_school_closest <- cost_to_closest(
+  ttm_waikato,
+  land_use_data = land_use_data,
+  opportunity = opportunity,
+  travel_cost = "travel_time_p50"
+)
+
+waikato_school_closest <- waikato_school_closest %>% left_join(waikato_pop$localised_population_interp, by = c("id" = "h3")) %>%
+  select(-geom) %>%
+  tidyr::replace_na(waikato_school_closest, list("population" = 0))
+
+waikato_school_closest_summary <- waikato_school_closest %>%
+  filter(population > 0)
+
+ggplot(waikato_school_closest_summary, aes(x = travel_time_p50, y = population)) + 
+  geom_point()
+
+summary(waikato_school_closest_summary)
+```
+
+
+```{r}
+tmap_access_plot_id(waikato_school_closest, "Waikato School Access by PT", "Waikato School Access by PT.html", "travel_time_p50", "travel_time_p50")
+```
+
+
+
+map cost to closest
+```{r}
+ttm_waikato_hospital_closest <- cell_to_polygon(waikato_hospital_closest, simple = FALSE)
+
+waikato_hospital_closest_poly <- st_as_sf(ttm_waikato_hospital_closest)
+
+waikato_hospital_closest_poly <- st_centroid(waikato_hospital_closest_poly)
+
+tmap_waikato_hospital_closest_poly <- tm_shape(waikato_hospital_closest_poly) + tm_polygons(col = "travel_time", style = "pretty" , alpha = 0.5, palette = "viridis", lwd = 0.01, title = "Travel Time (gravity)") + tm_layout(title = "Hospital Access in Waikato by Car")
+
+tmap_mode("view")
+
+tmap_waikato_hospital_closest_poly #+ tmap_h2s_stops
+
+tmap_save(tmap_waikato_hospital_closest_poly, "Travel time to closest hospital.html")
+```
+
+
+Gravity decay function to closest
+```{r}
+waikato_hospital_closest_gravity <- gravity(
+  ttm_waikato,
+  land_use_data = waikato_health_centroid,
+  opportunity = "opportunities",
+  travel_cost = "travel_time",
+  decay_function = decay_exponential(0.01)
+)
+```
+
+Map hospital decay function
+
+```{r}
+waikato_hospital_closest_gravity_poly <- cell_to_polygon(waikato_hospital_closest_gravity, simple = FALSE)
+
+waikato_hospital_closest_gravity_poly <- st_as_sf(waikato_hospital_closest_gravity_poly)
+
+tmap_waikato_hospital_closest_gravity_poly <- tm_shape(waikato_hospital_closest_gravity_poly) + tm_polygons(col = "opportunities", style = "pretty" , alpha = 0.5, palette = "viridis", lwd = 0.01, title = "Travel Time (gravity)") + tm_layout(title = "Hospital Access in Waikato by Car (gravity decay")
+
+tmap_mode("view")
+
+tmap_waikato_hospital_closest_gravity_poly #+ tmap_h2s_stops
+
+tmap_save(tmap_waikato_hospital_closest_poly, "Travel time to closest hospital.html")
+```
+
+Allocate to hex grid
+```{r}
+waikato_shops_centroid <- waikato_shops$osm_polygons %>% 
+  st_centroid() %>%
+  point_to_cell(simple = FALSE, res = res) %>%
+  rename(id = h3_resolution_7) %>%
+  mutate(opportunities = 1)
+
+waikato_shops_centroid <- left_join(waikato_h3_id, waikato_shops_centroid)
+
+library(tidyr)
+waikato_shops_centroid <- mutate(waikato_shops_centroid, opportunities = replace_na(opportunities, 0))
+
+```
+
+cost to closest groceries
+
+```{r}
+waikato_shops_closest <- cost_to_closest(
+  ttm_waikato,
+  land_use_data = waikato_shops_centroid,
+  opportunity = "opportunities",
+  travel_cost = "travel_time"
+)
+```
+
+
+map the groceries
+```{r}
+ttm_waikato_shops_closest <- cell_to_polygon(waikato_shops_closest, simple = FALSE)
+
+waikato_shops_closest_poly <- st_as_sf(ttm_waikato_shops_closest)
+
+tmap_waikato_shops_closest <- tm_shape(waikato_shops_closest_poly) + tm_polygons(col = "travel_time", style = "pretty" , alpha = 0.5, palette = "viridis", lwd = 0.01)
+
+tmap_mode("view")
+
+tmap_waikato_shops_closest #+ tmap_h2s_stops
+
+tmap_save(tmap_waikato_shops_closest, "Travel time to closest grocery store by car.html")
+```
+Gravity decay for shops
+```{r}
+waikato_shops_closest_gravity <- gravity(
+  ttm_waikato,
+  land_use_data = waikato_shops_centroid,
+  opportunity = "opportunities",
+  travel_cost = "travel_time",
+  decay_function = decay_exponential(0.08)
+)
+```
+Map groceries decay function
+
+```{r}
+waikato_shops_closest_gravity_poly <- cell_to_polygon(waikato_shops_closest_gravity, simple = FALSE)
+
+waikato_shops_closest_gravity_poly <- st_as_sf(waikato_shops_closest_gravity_poly)
+
+tmap_waikato_shops_closest_gravity_poly <- tm_shape(waikato_shops_closest_gravity_poly) + tm_polygons(col = "opportunities", style = "pretty" , alpha = 0.5, palette = "viridis", lwd = 0.01, title = "Travel Time (gravity decay)") + tm_layout(title = "Grocery Store Access in Waikato by Car (using a gravity decay of 0.08")
+
+tmap_mode("view")
+
+tmap_waikato_shops_closest_gravity_poly #+ tmap_h2s_stops
+
+tmap_save(tmap_waikato_shops_closest_gravity_poly, "Grocery Store Access in Waikato (gravity decay function).html")
+```
+################3
+#archive
+##############
+#Travel time matrix for all to some. If we do all to all that is over 7 billion pairs
+```{r}
+
+#filter the destinations for just the ones we want
+#destinations <- opportunities$combined_summary["school" = c(1,2),]
+
+#check if already written to disk and date
+
+#fix any errors with inputs
+waikato_routing_cells <- waikato_routing_cells %>%
+  st_transform(4326) %>%
+  st_make_valid() %>%
+  filter(!st_is_empty(.)) %>%
+  mutate(id = as.character(id))
+
+
+#currently set up so that its all to all 
+ttm_waikato_pt <- travel_time_matrix(
+  r5r_core_waikato,
+  origins = waikato_routing_cells |> st_crop(bbox_list[[1]]) |> select(-id, -lat, -lon) |> class(),
+  destinations = waikato_routing_cells |> select(-id, -lat, -lon),
+  mode = mode,
+  departure_datetime = departure_datetime,
+  max_walk_time = max_walk_time,
+  max_trip_duration = max_trip_duration,
+  walk_speed = walk_speed
+)
+
+head(ttm_waikato_pt)
+
+saveRDS(ttm_waikato_pt, "ttm_waikato_pt.rds")
+
+#save results to disk
+```
+#check gtfs data
+```{r}
+gtfs <- gtfstools::read_gtfs("C:/Users/ellio/OneDrive/Documents/GIS Data/R5R/Waikato/Router_do_min/improved-gtfs-waikato-regional-council-1.zip")
+
+
+
+gtfstools::validate_gtfs(gtfs, tempfile("validation_result"), gtfstools::download_validator(tempdir()))
+```
+
+#rnatural earth boundaries
+```{r}
+#provides poor boundaries that overlaps with land
+
+#download the Natural Earth NZ polygon (everything that’s land)
+land_polys <- rnaturalearth::ne_countries(scale = 10, country = "New Zealand") |> st_crop(waikato_bbox)
+            # optional: limit to your bbox
+
+#find h3 cells on land
+land_cells <- polygon_to_cells(land_polys, res = res, simple = TRUE) |> 
+  list_c() #flatten list
+
+sub_waikato_routing_cells <- all_waikato_routing_cells[all_waikato_routing_cells$id %in% land_cells,]
+
+```
+
+
