@@ -4,3 +4,7 @@
 .httr-oauth
 .DS_Store
 .quarto
+# Ignore everything in renv folder...
+renv/*
+# But don't ignore activate.R
+!renv/activate.R

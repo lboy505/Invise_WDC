@@ -7,6 +7,9 @@ output: html_notebook
 - or can i just use the jobs_h3 output anyway?
 #load in previous analysis
 ```{r}
+
+# This is results loading once the data has been generated. Not available to Luke right now
+
 #ttm data
 ttm_bicycle_results_list <- readRDS("ttm_bicycle_results_list.rds")
 
@@ -19,7 +22,8 @@ car_results <- readRDS()
 # load packages and functions -----------------------------------------
 ```{r}
 #increases memory available to java
-options(java.parameters = "-Xmx4G")
+# Luke has set his in the R profile to 24gb
+# options(java.parameters = "-Xmx24G")
 
 # install dev version with latest features
 #devtools::install_github("ipeaGIT/r5r", subdir = "r-package")
